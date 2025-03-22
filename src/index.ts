@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
 	ListObjectsV2Command,
 	type ListObjectsV2CommandInput,
@@ -5,6 +7,16 @@ import {
 } from "@aws-sdk/client-s3";
 import micromatch from "micromatch";
 import pLimit from "p-limit";
+
+// Helper function to check if a file exists
+const pathExists = async (filePath: string): Promise<boolean> => {
+	try {
+		await fs.access(filePath);
+		return true;
+	} catch (e) {
+		return false;
+	}
+};
 
 /**
  * A utility class for efficient path lookups using micromatch
@@ -309,10 +321,16 @@ export class S3PathMatcher extends PathMatcher {
 				processed: number;
 				total: number;
 				matched: number;
+				skippedExisting?: number;
 			}) => void;
 			concurrency?: {
 				requestLimit?: number; // S3 API calls limit
 				processingLimit?: number; // Pattern matching limit
+			};
+			localCache?: {
+				enabled: boolean;
+				basePath: string;
+				skipExisting?: boolean;
 			};
 		} = {},
 	): Promise<string[]> {
@@ -325,6 +343,7 @@ export class S3PathMatcher extends PathMatcher {
 			abortSignal,
 			onProgress,
 			concurrency = {},
+			localCache,
 		} = options;
 
 		const { requestLimit = maxConcurrentRequests, processingLimit = 20 } =
@@ -349,6 +368,7 @@ export class S3PathMatcher extends PathMatcher {
 		const matchingPaths: string[] = [];
 		let processed = 0;
 		let total = 0;
+		let skippedExisting = 0;
 
 		// Parameters for listing objects
 		const params: ListObjectsV2CommandInput = {
@@ -408,24 +428,36 @@ export class S3PathMatcher extends PathMatcher {
 						result.contents.length +
 						currentTokens.length * maxKeysPerRequest; // Estimate
 
-					// Filter paths in parallel with controlled concurrency
-					const pathProcessPromises = result.contents.map((item) => {
+					// Process contents with controlled concurrency
+					const processingPromises = result.contents.map((item) => {
 						return processingLimiter(async () => {
 							processed++;
 
-							if (item.Key && pathMatchesFn(item.Key)) {
-								return item.Key;
+							if (!item.Key || !pathMatchesFn(item.Key)) {
+								return null; // Not matching pattern
 							}
-							return null;
+
+							// Check if we should skip existing files
+							if (localCache?.enabled && localCache.skipExisting) {
+								const localFilePath = path.join(localCache.basePath, item.Key);
+								const exists = await pathExists(localFilePath);
+
+								if (exists) {
+									skippedExisting++;
+									return null; // Skip - file exists
+								}
+							}
+
+							return item.Key; // Return matching path
 						});
 					});
 
-					// Collect matching paths
-					const batchPaths = await Promise.all(pathProcessPromises);
-					const filteredPaths = batchPaths.filter(
-						(path): path is string => path !== null,
+					// Collect paths that passed all checks
+					const processedResults = await Promise.all(processingPromises);
+					const validPaths = processedResults.filter(
+						(filePath): filePath is string => filePath !== null,
 					);
-					matchingPaths.push(...filteredPaths);
+					matchingPaths.push(...validPaths);
 
 					// Report progress if callback provided
 					if (onProgress) {
@@ -433,6 +465,7 @@ export class S3PathMatcher extends PathMatcher {
 							processed,
 							total,
 							matched: matchingPaths.length,
+							skippedExisting,
 						});
 					}
 				}
@@ -471,9 +504,20 @@ export class S3PathMatcher extends PathMatcher {
 				processed: number;
 				total: number;
 				matched: number;
+				skippedExisting?: number;
 			}) => void;
+			localCache?: {
+				enabled: boolean;
+				basePath: string;
+				skipExisting?: boolean;
+			};
 		} = {},
-	): Promise<{ processed: number; matched: number; skipped: number }> {
+	): Promise<{
+		processed: number;
+		matched: number;
+		skipped: number;
+		skippedExisting: number;
+	}> {
 		const {
 			prefix = "",
 			batchSize = 1000,
@@ -483,6 +527,7 @@ export class S3PathMatcher extends PathMatcher {
 			maxConcurrentProcessing = 10,
 			abortSignal,
 			onProgress,
+			localCache,
 		} = options;
 
 		// Create limiters for both S3 API calls and file processing
@@ -513,6 +558,7 @@ export class S3PathMatcher extends PathMatcher {
 		let totalProcessed = 0;
 		let totalMatched = 0;
 		let totalSkipped = 0;
+		let totalSkippedExisting = 0;
 
 		// Start with initial request (no token)
 		let currentTokens: (string | undefined)[] = [undefined];
@@ -536,19 +582,36 @@ export class S3PathMatcher extends PathMatcher {
 						new ListObjectsV2Command(tokenParams),
 					);
 
-					// Find matching paths
+					// Process contents to find matching paths
+					const contents = response.Contents ?? [];
 					const matchingPaths: string[] = [];
-					for (const item of response.Contents ?? []) {
+
+					// Process all items to check pattern match and local existence
+					for (const item of contents) {
 						totalProcessed++;
 
-						if (item.Key) {
-							if (pathMatches(item.Key)) {
-								matchingPaths.push(item.Key);
-								totalMatched++;
-							} else {
-								totalSkipped++;
+						if (!item.Key) continue;
+
+						// Check if it matches the pattern
+						if (!pathMatches(item.Key)) {
+							totalSkipped++;
+							continue;
+						}
+
+						// Check if the file exists locally and should be skipped
+						if (localCache?.enabled && localCache.skipExisting) {
+							const localPath = path.join(localCache.basePath, item.Key);
+							const exists = await pathExists(localPath);
+
+							if (exists) {
+								totalSkippedExisting++;
+								continue;
 							}
 						}
+
+						// File matches and doesn't exist locally (or we don't care)
+						matchingPaths.push(item.Key);
+						totalMatched++;
 					}
 
 					return {
@@ -587,17 +650,17 @@ export class S3PathMatcher extends PathMatcher {
 									processingLimiter(() => processor(path)),
 								),
 							);
-
-							// Report progress if callback provided
-							if (onProgress) {
-								onProgress({
-									processed: totalProcessed,
-									total:
-										totalProcessed + currentTokens.length * maxKeysPerRequest, // Estimate
-									matched: totalMatched,
-								});
-							}
 						}
+					}
+
+					// Report progress if callback provided
+					if (onProgress) {
+						onProgress({
+							processed: totalProcessed,
+							total: totalProcessed + currentTokens.length * maxKeysPerRequest,
+							matched: totalMatched,
+							skippedExisting: totalSkippedExisting,
+						});
 					}
 				}
 			} catch (error) {
@@ -606,6 +669,7 @@ export class S3PathMatcher extends PathMatcher {
 						processed: totalProcessed,
 						matched: totalMatched,
 						skipped: totalSkipped,
+						skippedExisting: totalSkippedExisting,
 					};
 				}
 				throw error;
@@ -616,6 +680,7 @@ export class S3PathMatcher extends PathMatcher {
 			processed: totalProcessed,
 			matched: totalMatched,
 			skipped: totalSkipped,
+			skippedExisting: totalSkippedExisting,
 		};
 	}
 
@@ -636,6 +701,11 @@ export class S3PathMatcher extends PathMatcher {
 			matchOptions?: micromatch.Options;
 			abortSignal?: AbortSignal;
 			groupKeyFn?: (captures: string[]) => string;
+			localCache?: {
+				enabled: boolean;
+				basePath: string;
+				skipExisting?: boolean;
+			};
 		} = {},
 	): Promise<Record<string, string[]>> {
 		const {
@@ -645,6 +715,7 @@ export class S3PathMatcher extends PathMatcher {
 			matchOptions,
 			abortSignal,
 			groupKeyFn = (captures) => captures[0], // Default to first capture
+			localCache,
 		} = options;
 
 		// List all objects with the given prefix
@@ -677,13 +748,27 @@ export class S3PathMatcher extends PathMatcher {
 
 			// Process each batch concurrently
 			await Promise.all(
-				batch.map((path) =>
-					limiter(() => {
+				batch.map((filePath) =>
+					limiter(async () => {
 						if (abortSignal?.aborted) {
 							return;
 						}
 
-						const captured = this.capture(capturePattern, path, matchOptions);
+						// Skip if file exists locally and skipExisting is enabled
+						if (localCache?.enabled && localCache.skipExisting) {
+							const localPath = path.join(localCache.basePath, filePath);
+							const exists = await pathExists(localPath);
+
+							if (exists) {
+								return;
+							}
+						}
+
+						const captured = this.capture(
+							capturePattern,
+							filePath,
+							matchOptions,
+						);
 
 						if (captured) {
 							// Use the provided function to determine the group key
@@ -693,7 +778,7 @@ export class S3PathMatcher extends PathMatcher {
 								groups[key] = [];
 							}
 
-							groups[key].push(path);
+							groups[key].push(filePath);
 						}
 					}),
 				),
@@ -738,6 +823,12 @@ async function example() {
 				concurrency: {
 					requestLimit: 10, // Limit to 10 concurrent S3 API calls
 					processingLimit: 50, // Limit to 50 concurrent pattern matches
+				},
+				// Example of the new option to skip existing files
+				localCache: {
+					enabled: true,
+					basePath: "/path/to/local/cache",
+					skipExisting: true, // Skip files that already exist locally
 				},
 			},
 		);

@@ -189,3 +189,44 @@ That's awesome! Feel free to add it to the list.
 ⏲️ **[Fake Time Series](https://github.com/TimMikeladze/fake-time-series/)** - A flexible CLI tool and library for generating fake time series data. Perfect for testing, development, and demonstration purposes.
 
 📡 **[Install Command](https://github.com/TimMikeladze/react-install-command/)** - A React component for rendering a 'npm install <package name>' command block. Supports multiple package managers.
+
+## Testing
+
+The project uses Vitest for unit and integration testing. Tests are organized by functionality:
+
+- `PathMatcher`: Tests for the basic glob pattern matching utilities
+- `S3PathMatcher`: Integration tests for AWS S3 operations
+
+### Running Tests
+
+```bash
+# Run all tests once
+npm test
+
+# Run tests in watch mode (during development)
+npm run test:watch
+
+# Run tests with coverage report
+npm run test:coverage
+```
+
+### S3 Integration Tests
+
+The S3 integration tests require either:
+
+1. AWS credentials with S3 access configured in your environment
+2. A local S3-compatible service like LocalStack
+
+When running locally, the tests default to using a LocalStack endpoint (`http://localhost:4566`). In CI environments, they use the actual AWS S3 service.
+
+To use LocalStack for testing:
+
+```bash
+# Start LocalStack (requires Docker)
+docker-compose up -d
+
+# Run tests
+npm test
+```
+
+The tests automatically create a unique test bucket, populate it with test objects, and clean up after completion.
