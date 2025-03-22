@@ -1,5 +1,5 @@
 {
-	"name": "typescript-react-package-starter",
+	"name": "rehiver",
 	"description": "",
 	"version": "0.0.0",
 	"author": "",
@@ -10,7 +10,7 @@
 		"url": ""
 	},
 	"scripts": {
-		"dev": "concurrently \"pnpm build --watch\" \"pnpm storybook\" \"pnpm test\" ",
+		"dev": "concurrently \"pnpm build --watch\" \"pnpm test\" ",
 		"build": "tsup",
 		"lint": "biome check --write --unsafe .",
 		"lint:ci": "biome check --unsafe .",
@@ -64,6 +64,7 @@
 		"@storybook/test": "8.6.2",
 		"@testing-library/jest-dom": "6.6.3",
 		"@testing-library/react": "16.2.0",
+		"@types/micromatch": "^4.0.9",
 		"@types/node": "22.13.8",
 		"@types/react": "18.3.13",
 		"@types/react-dom": "18.3.1",
@@ -92,6 +93,17 @@
 	"pnpm": {
 		"overrides": {
 			"micromatch@<4.0.8": ">=4.0.8"
-		}
+		},
+		"onlyBuiltDependencies": [
+			"@biomejs/biome",
+			"@swc/core",
+			"esbuild",
+			"lefthook"
+		]
+	},
+	"dependencies": {
+		"@aws-sdk/client-s3": "^3.772.0",
+		"micromatch": "^4.0.8",
+		"p-limit": "^6.2.0"
 	}
 }
