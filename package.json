@@ -105,6 +105,7 @@
 	"dependencies": {
 		"@aws-sdk/client-s3": "^3.772.0",
 		"micromatch": "^4.0.8",
-		"p-limit": "^6.2.0"
+		"p-limit": "^6.2.0",
+		"zod": "^3.24.2"
 	}
 }

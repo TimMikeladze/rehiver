@@ -1288,3 +1288,346 @@ async function changeDetectionExample() {
 		console.error("Error in change detection:", error);
 	}
 }
+
+import { z } from "zod";
+
+/**
+ * HivePartitionParser - A utility for parsing Hive partition paths and validating them with Zod schemas
+ */
+export class HivePartitionParser<T extends z.ZodTypeAny> {
+	private schema: T;
+	private partitionKeys: string[];
+
+	/**
+	 * Create a new HivePartitionParser with a Zod schema
+	 * @param schema A Zod schema that defines the structure and types of partition keys
+	 */
+	constructor(schema: T) {
+		this.schema = schema;
+		// Extract expected keys from the Zod schema
+		// @ts-expect-error
+		this.partitionKeys = Object.keys(schema.shape || {});
+	}
+
+	/**
+	 * Parse a Hive partition path and return a typed object
+	 * @param path The partition path to parse (e.g., "/table/year=2023/month=12/day=25")
+	 * @returns A validated object matching the schema type
+	 * @throws If validation fails or required partitions are missing
+	 */
+	parse(path: string): z.infer<T> {
+		// Extract key-value pairs from the path
+		const segments = path.split("/").filter((segment) => segment.length > 0);
+		const rawPartitions: Record<string, string> = {};
+
+		for (const segment of segments) {
+			if (segment.includes("=")) {
+				const [key, value] = segment.split("=", 2);
+				if (key && value !== undefined) {
+					rawPartitions[key] = value;
+				}
+			}
+		}
+
+		// Validate using the Zod schema
+		return this.schema.parse(rawPartitions);
+	}
+
+	/**
+	 * Try to parse a path, returning a result object with success/error information
+	 * @param path The partition path to parse
+	 * @returns A Zod parse result with either data or error
+	 */
+	safeParse(path: string): z.SafeParseReturnType<unknown, z.infer<T>> {
+		// Extract key-value pairs from the path
+		const segments = path.split("/").filter((segment) => segment.length > 0);
+		const rawPartitions: Record<string, string> = {};
+
+		for (const segment of segments) {
+			if (segment.includes("=")) {
+				const [key, value] = segment.split("=", 2);
+				if (key && value !== undefined) {
+					rawPartitions[key] = value;
+				}
+			}
+		}
+
+		// Validate using the Zod schema
+		return this.schema.safeParse(rawPartitions);
+	}
+
+	/**
+	 * Format a typed object into a Hive partition path
+	 * @param data An object matching the schema
+	 * @returns A formatted partition path string
+	 */
+	format(data: z.infer<T>): string {
+		const validated = this.schema.parse(data);
+		const segments: string[] = [];
+
+		for (const key of this.partitionKeys) {
+			const value = validated[key as keyof typeof validated];
+			if (value !== undefined) {
+				segments.push(`${key}=${value}`);
+			}
+		}
+
+		return segments.join("/");
+	}
+
+	/**
+	 * Create a glob pattern from partial partition data
+	 * @param partialData Partial data with some partition keys specified
+	 * @returns A glob pattern that can match multiple partitions
+	 */
+	createGlobPattern(partialData: Partial<z.infer<T>>): string {
+		const segments: string[] = [];
+
+		for (const key of this.partitionKeys) {
+			const keyName = key as keyof typeof partialData;
+			if (keyName in partialData && partialData[keyName] !== undefined) {
+				segments.push(`${key}=${partialData[keyName]}`);
+			} else {
+				segments.push(`${key}=*`);
+			}
+		}
+
+		return segments.join("/");
+	}
+
+	/**
+	 * Check if a partition path is valid according to the schema
+	 * @param path The partition path to validate
+	 * @returns True if the path is valid, false otherwise
+	 */
+	isValid(path: string): boolean {
+		const result = this.safeParse(path);
+		return result.success;
+	}
+
+	/**
+	 * Get validation errors for a path
+	 * @param path The partition path to validate
+	 * @returns Array of error messages or empty array if valid
+	 */
+	getValidationErrors(path: string): string[] {
+		const result = this.safeParse(path);
+		if (result.success) {
+			return [];
+		}
+		return result.error.errors.map(
+			(err) => `${err.path.join(".")}: ${err.message}`,
+		);
+	}
+
+	/**
+	 * Find missing partition keys in a path
+	 * @param path The partition path to check
+	 * @returns Array of missing key names
+	 */
+	getMissingKeys(path: string): string[] {
+		const segments = path.split("/").filter((segment) => segment.length > 0);
+		const foundKeys = new Set<string>();
+
+		for (const segment of segments) {
+			if (segment.includes("=")) {
+				const [key] = segment.split("=", 1);
+				if (key) {
+					foundKeys.add(key);
+				}
+			}
+		}
+
+		return this.partitionKeys.filter((key) => !foundKeys.has(key));
+	}
+
+	/**
+	 * Extract only specific keys from a partition path
+	 * @param path The partition path
+	 * @param keys Keys to extract
+	 * @returns Object containing only the specified keys
+	 */
+	extractKeys(path: string, keys: string[]): Partial<z.infer<T>> {
+		const full = this.safeParse(path);
+		if (!full.success) {
+			throw new Error(`Invalid partition path: ${path}`);
+		}
+
+		const result: Partial<z.infer<T>> = {};
+		for (const key of keys) {
+			if (key in full.data) {
+				result[key as keyof typeof result] =
+					full.data[key as keyof typeof full.data];
+			}
+		}
+
+		return result;
+	}
+
+	/**
+	 * Apply a transformation function to partition values
+	 * @param path Original partition path
+	 * @param transformFn Function that takes current values and returns new values
+	 * @returns New partition path with transformed values
+	 */
+	transform(
+		path: string,
+		transformFn: (data: z.infer<T>) => Partial<z.infer<T>>,
+	): string {
+		const parsed = this.parse(path);
+		const transformed = { ...parsed, ...transformFn(parsed) };
+		return this.format(transformed);
+	}
+
+	/**
+	 * Check if a path matches a glob pattern
+	 * Uses simplified glob matching logic for * wildcards
+	 * @param path The path to check
+	 * @param pattern The glob pattern
+	 * @returns True if the path matches the pattern
+	 */
+	matchesGlob(path: string, pattern: string): boolean {
+		const pathSegments = path
+			.split("/")
+			.filter((segment) => segment.length > 0);
+		const patternSegments = pattern
+			.split("/")
+			.filter((segment) => segment.length > 0);
+
+		if (pathSegments.length !== patternSegments.length) {
+			return false;
+		}
+
+		for (let i = 0; i < pathSegments.length; i++) {
+			const pathSeg = pathSegments[i];
+			const patternSeg = patternSegments[i];
+
+			if (!this.segmentMatchesPattern(pathSeg, patternSeg)) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	private segmentMatchesPattern(segment: string, pattern: string): boolean {
+		// Handle exact match
+		if (segment === pattern) {
+			return true;
+		}
+
+		// Handle key=* wildcard pattern
+		if (pattern.includes("=*")) {
+			const [patternKey] = pattern.split("=", 1);
+			const [segmentKey] = segment.split("=", 1);
+			return patternKey === segmentKey;
+		}
+
+		// Handle more complex patterns with wildcards
+		const regex = new RegExp(
+			`^${pattern.replace(/\*/g, ".*").replace(/\?/g, ".")}$`,
+		);
+
+		return regex.test(segment);
+	}
+}
+
+// Extended example usage
+function runExamples() {
+	// 1. Basic date partition schema
+	const datePartitionSchema = z.object({
+		year: z.coerce.number().int().min(2000).max(2100),
+		month: z.coerce.number().int().min(1).max(12),
+		day: z.coerce.number().int().min(1).max(31),
+	});
+
+	const dateParser = new HivePartitionParser(datePartitionSchema);
+
+	// Parse a date partition
+	const dateData = dateParser.parse("/data/year=2023/month=12/day=25");
+	console.log("Date Partition Data:", dateData);
+
+	// Format data back to a path
+	const datePath = dateParser.format({ year: 2024, month: 3, day: 22 });
+	console.log("Formatted Date Path:", datePath);
+
+	// Create a glob pattern for March 2024
+	const dateGlob = dateParser.createGlobPattern({ year: 2024, month: 3 });
+	console.log("Date Glob Pattern:", dateGlob);
+
+	// Check if a path is valid
+	console.log(
+		"Valid path?",
+		dateParser.isValid("/data/year=2023/month=12/day=25"),
+	);
+	console.log(
+		"Invalid path?",
+		dateParser.isValid("/data/year=2023/month=13/day=25"),
+	);
+
+	// Get validation errors
+	const dateErrors = dateParser.getValidationErrors(
+		"/data/year=2023/month=13/day=32",
+	);
+	console.log("Validation Errors:", dateErrors);
+
+	// 2. More complex analytics partition schema
+	const analyticsPartitionSchema = z.object({
+		region: z.enum(["us-east", "us-west", "eu", "asia"]),
+		service: z.string().min(1),
+		year: z.coerce.number().int().min(2000),
+		month: z.coerce.number().int().min(1).max(12),
+		day: z.coerce.number().int().min(1).max(31),
+		event_type: z.enum(["click", "view", "purchase", "error"]),
+	});
+
+	const analyticsParser = new HivePartitionParser(analyticsPartitionSchema);
+
+	// Parse a complex analytics path
+	const analyticsData = analyticsParser.safeParse(
+		"/analytics/region=us-east/service=checkout/year=2023/month=12/day=25/event_type=purchase",
+	);
+	console.log(
+		"Analytics Parse Result:",
+		analyticsData.success ? analyticsData.data : analyticsData.error,
+	);
+
+	// Extract only specific keys
+	if (analyticsData.success) {
+		const regionAndService = analyticsParser.extractKeys(
+			"/analytics/region=us-east/service=checkout/year=2023/month=12/day=25/event_type=purchase",
+			["region", "service"],
+		);
+		console.log("Extracted Region and Service:", regionAndService);
+	}
+
+	// Transform a path
+	const transformed = analyticsParser.transform(
+		"/analytics/region=us-east/service=checkout/year=2023/month=12/day=25/event_type=purchase",
+		(data) => ({ region: "eu", month: data.month + 1 }),
+	);
+	console.log("Transformed Path:", transformed);
+
+	// Check glob matching
+	const matchesGlob = analyticsParser.matchesGlob(
+		"/analytics/region=us-east/service=checkout/year=2023/month=12/day=25/event_type=purchase",
+		"region=us-east/service=*/year=2023/month=*/day=*/event_type=purchase",
+	);
+	console.log("Matches Glob Pattern:", matchesGlob);
+
+	// 3. Partition with optional and nullable fields
+	const logPartitionSchema = z.object({
+		app: z.string(),
+		environment: z.enum(["dev", "test", "staging", "prod"]),
+		date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+		level: z.enum(["INFO", "WARN", "ERROR", "DEBUG"]).optional(),
+		instance: z.string().nullable(),
+	});
+
+	const logParser = new HivePartitionParser(logPartitionSchema);
+
+	const logData = logParser.parse(
+		"/logs/app=api/environment=prod/date=2023-12-25/level=ERROR/instance=null",
+	);
+	console.log("Log Data:", logData);
+}

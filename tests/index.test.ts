@@ -8,9 +8,11 @@ import {
 	S3Client,
 } from "@aws-sdk/client-s3";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
 	ChangeDetectionEngine,
 	ChangeType,
+	HivePartitionParser,
 	type ObjectMetadata,
 	PathMatcher,
 	S3PathMatcher,
@@ -719,4 +721,322 @@ describe("S3 Change Detection Integration", () => {
 			}),
 		);
 	}, 30000);
+});
+
+describe("HivePartitionParser", () => {
+	// Basic partition schema for most tests
+	const datePartitionSchema = z.object({
+		year: z.coerce.number().int().min(2000).max(2100),
+		month: z.coerce.number().int().min(1).max(12),
+		day: z.coerce.number().int().min(1).max(31),
+	});
+
+	const dateParser = new HivePartitionParser(datePartitionSchema);
+
+	describe("constructor", () => {
+		it("should create a parser with the given schema", () => {
+			const parser = new HivePartitionParser(datePartitionSchema);
+			expect(parser).toBeDefined();
+		});
+	});
+
+	describe("parse", () => {
+		it("should parse a valid path", () => {
+			const result = dateParser.parse("/data/year=2023/month=12/day=25");
+			expect(result).toEqual({ year: 2023, month: 12, day: 25 });
+		});
+
+		it("should parse values with leading zeros", () => {
+			const result = dateParser.parse("/data/year=2023/month=01/day=05");
+			expect(result).toEqual({ year: 2023, month: 1, day: 5 });
+		});
+
+		it("should ignore non-partition path segments", () => {
+			const result = dateParser.parse(
+				"/warehouse/mydb/table/year=2023/month=12/day=25",
+			);
+			expect(result).toEqual({ year: 2023, month: 12, day: 25 });
+		});
+
+		it("should throw on invalid values", () => {
+			expect(() =>
+				dateParser.parse("/data/year=2023/month=13/day=25"),
+			).toThrow();
+			expect(() =>
+				dateParser.parse("/data/year=2023/month=12/day=32"),
+			).toThrow();
+			expect(() =>
+				dateParser.parse("/data/year=1999/month=12/day=25"),
+			).toThrow();
+		});
+
+		it("should throw on missing partition keys", () => {
+			expect(() => dateParser.parse("/data/year=2023/month=12")).toThrow();
+			expect(() => dateParser.parse("/data/year=2023/day=25")).toThrow();
+		});
+	});
+
+	describe("safeParse", () => {
+		it("should return success result for valid path", () => {
+			const result = dateParser.safeParse("/data/year=2023/month=12/day=25");
+			expect(result.success).toBe(true);
+			if (result.success) {
+				expect(result.data).toEqual({ year: 2023, month: 12, day: 25 });
+			}
+		});
+
+		it("should return error result for invalid path", () => {
+			const result = dateParser.safeParse("/data/year=2023/month=13/day=25");
+			expect(result.success).toBe(false);
+		});
+	});
+
+	describe("format", () => {
+		it("should format partition data to a path", () => {
+			const path = dateParser.format({ year: 2024, month: 3, day: 22 });
+			expect(path).toBe("year=2024/month=3/day=22");
+		});
+
+		it("should validate data before formatting", () => {
+			expect(() =>
+				dateParser.format({
+					year: 2024,
+					month: 13,
+					day: 22,
+				} as z.infer<typeof datePartitionSchema>),
+			).toThrow();
+		});
+	});
+
+	describe("createGlobPattern", () => {
+		it("should create a glob pattern with wildcards for unspecified fields", () => {
+			const pattern = dateParser.createGlobPattern({ year: 2024, month: 3 });
+			expect(pattern).toBe("year=2024/month=3/day=*");
+		});
+
+		it("should create a fully wildcarded pattern when no fields specified", () => {
+			const pattern = dateParser.createGlobPattern({});
+			expect(pattern).toBe("year=*/month=*/day=*");
+		});
+
+		it("should not validate the provided partial data", () => {
+			// This would normally fail validation, but should work for glob patterns
+			const pattern = dateParser.createGlobPattern({ year: 1999 });
+			expect(pattern).toBe("year=1999/month=*/day=*");
+		});
+	});
+
+	describe("isValid", () => {
+		it("should return true for valid paths", () => {
+			expect(dateParser.isValid("/data/year=2023/month=12/day=25")).toBe(true);
+		});
+
+		it("should return false for invalid paths", () => {
+			expect(dateParser.isValid("/data/year=2023/month=13/day=25")).toBe(false);
+			expect(dateParser.isValid("/data/year=2023/month=12")).toBe(false);
+		});
+	});
+
+	describe("getValidationErrors", () => {
+		it("should return empty array for valid paths", () => {
+			const errors = dateParser.getValidationErrors(
+				"/data/year=2023/month=12/day=25",
+			);
+			expect(errors).toEqual([]);
+		});
+
+		it("should return error messages for invalid paths", () => {
+			const errors = dateParser.getValidationErrors(
+				"/data/year=2023/month=13/day=32",
+			);
+			expect(errors.length).toBeGreaterThan(0);
+			expect(errors[0]).toContain("month");
+			expect(errors[1]).toContain("day");
+		});
+	});
+
+	describe("getMissingKeys", () => {
+		it("should return empty array when all keys present", () => {
+			const missing = dateParser.getMissingKeys(
+				"/data/year=2023/month=12/day=25",
+			);
+			expect(missing).toEqual([]);
+		});
+
+		it("should return missing key names", () => {
+			const missing = dateParser.getMissingKeys("/data/year=2023/month=12");
+			expect(missing).toEqual(["day"]);
+		});
+	});
+
+	describe("extractKeys", () => {
+		it("should extract only specified keys", () => {
+			const extracted = dateParser.extractKeys(
+				"/data/year=2023/month=12/day=25",
+				["year", "month"],
+			);
+			expect(extracted).toEqual({ year: 2023, month: 12 });
+		});
+
+		it("should throw for invalid paths", () => {
+			expect(() =>
+				dateParser.extractKeys("/data/year=2023/month=13/day=25", [
+					"year",
+					"month",
+				]),
+			).toThrow();
+		});
+	});
+
+	describe("transform", () => {
+		it("should apply transformations to partition values", () => {
+			// Expect a validation error to be thrown when attempting to format
+			// an invalid transformation (month=13)
+			expect(() =>
+				dateParser.transform("/data/year=2023/month=11/day=25", (data) => ({
+					month: data.month + 2,
+				})),
+			).toThrow();
+		});
+
+		it("should apply valid transformations", () => {
+			const transformed = dateParser.transform(
+				"/data/year=2023/month=11/day=25",
+				(data) => ({ month: data.month + 1 }),
+			);
+
+			const result = dateParser.parse(transformed);
+			expect(result).toEqual({ year: 2023, month: 12, day: 25 });
+		});
+	});
+
+	describe("matchesGlob", () => {
+		it("should match exact paths", () => {
+			expect(
+				dateParser.matchesGlob(
+					"year=2023/month=12/day=25",
+					"year=2023/month=12/day=25",
+				),
+			).toBe(true);
+		});
+
+		it("should match paths with wildcards", () => {
+			expect(
+				dateParser.matchesGlob(
+					"year=2023/month=12/day=25",
+					"year=2023/month=*/day=*",
+				),
+			).toBe(true);
+		});
+
+		it("should not match paths with different segment counts", () => {
+			expect(
+				dateParser.matchesGlob(
+					"year=2023/month=12/day=25",
+					"year=2023/month=12",
+				),
+			).toBe(false);
+		});
+
+		it("should not match paths with non-matching segments", () => {
+			expect(
+				dateParser.matchesGlob(
+					"year=2023/month=12/day=25",
+					"year=2024/month=*/day=*",
+				),
+			).toBe(false);
+		});
+	});
+
+	// Test with a more complex schema
+	describe("complex schema", () => {
+		const analyticsSchema = z.object({
+			region: z.enum(["us-east", "us-west", "eu", "asia"]),
+			service: z.string().min(1),
+			year: z.coerce.number().int().min(2000),
+			month: z.coerce.number().int().min(1).max(12),
+			eventType: z.enum(["click", "view", "purchase", "error"]),
+		});
+
+		const analyticsParser = new HivePartitionParser(analyticsSchema);
+
+		it("should parse complex paths", () => {
+			const result = analyticsParser.parse(
+				"/analytics/region=us-east/service=checkout/year=2023/month=12/eventType=purchase",
+			);
+
+			expect(result).toEqual({
+				region: "us-east",
+				service: "checkout",
+				year: 2023,
+				month: 12,
+				eventType: "purchase",
+			});
+		});
+
+		it("should validate enum values", () => {
+			expect(() =>
+				analyticsParser.parse(
+					"/analytics/region=invalid/service=checkout/year=2023/month=12/event_type=purchase",
+				),
+			).toThrow();
+		});
+	});
+
+	// Test with optional and nullable fields
+	describe("optional fields", () => {
+		const logSchema = z.object({
+			app: z.string(),
+			environment: z.enum(["dev", "test", "staging", "prod"]),
+			date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+			level: z.enum(["INFO", "WARN", "ERROR", "DEBUG"]).optional(),
+			instance: z
+				.string()
+				.nullable()
+				.transform((v) => (v === "null" ? null : v)),
+		});
+
+		const logParser = new HivePartitionParser(logSchema);
+
+		it("should parse with optional fields present", () => {
+			const result = logParser.parse(
+				"/logs/app=api/environment=prod/date=2023-12-25/level=ERROR/instance=server01",
+			);
+
+			expect(result).toEqual({
+				app: "api",
+				environment: "prod",
+				date: "2023-12-25",
+				level: "ERROR",
+				instance: "server01",
+			});
+		});
+
+		it("should parse with optional fields missing", () => {
+			const result = logParser.parse(
+				"/logs/app=api/environment=prod/date=2023-12-25/instance=server01",
+			);
+
+			expect(result).toEqual({
+				app: "api",
+				environment: "prod",
+				date: "2023-12-25",
+				instance: "server01",
+			});
+		});
+
+		it("should parse null values", () => {
+			const result = logParser.parse(
+				"/logs/app=api/environment=prod/date=2023-12-25/level=ERROR/instance=null",
+			);
+
+			expect(result).toEqual({
+				app: "api",
+				environment: "prod",
+				date: "2023-12-25",
+				level: "ERROR",
+				instance: null,
+			});
+		});
+	});
 });
