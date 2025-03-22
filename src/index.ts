@@ -19,6 +19,277 @@ const pathExists = async (filePath: string): Promise<boolean> => {
 };
 
 /**
+ * Interface for object metadata
+ */
+export interface ObjectMetadata {
+	key: string;
+	size: number;
+	etag: string;
+	lastModified: Date;
+}
+
+/**
+ * S3 object interface matching AWS SDK structure with camelCase properties
+ */
+export interface S3Object {
+	key?: string;
+	size?: number;
+	etag?: string;
+	lastModified?: Date;
+}
+
+/**
+ * Change types for tracking object modifications
+ */
+export enum ChangeType {
+	Added = "added",
+	Modified = "modified",
+	Deleted = "deleted",
+	Unchanged = "unchanged",
+}
+
+/**
+ * Result of a change detection comparison
+ */
+export interface ChangeResult {
+	changeType: ChangeType;
+	object: ObjectMetadata;
+	previousVersion?: ObjectMetadata;
+}
+
+/**
+ * Options for change detection
+ */
+export interface ChangeDetectionOptions {
+	stateFilePath?: string;
+	compareMode?: "quick" | "full";
+	ignoreEtagOnSize?: boolean;
+	trackDeleted?: boolean;
+}
+
+/**
+ * Engine for detecting changes in S3 objects between runs
+ */
+export class ChangeDetectionEngine {
+	private previousState: Map<string, ObjectMetadata> = new Map();
+	private currentState: Map<string, ObjectMetadata> = new Map();
+	private options: ChangeDetectionOptions;
+
+	/**
+	 * Creates a new ChangeDetectionEngine
+	 * @param options Engine configuration options
+	 */
+	constructor(options: ChangeDetectionOptions = {}) {
+		this.options = {
+			stateFilePath: "change-detection-state.json",
+			compareMode: "full",
+			ignoreEtagOnSize: false,
+			trackDeleted: true,
+			...options,
+		};
+	}
+
+	/**
+	 * Loads the previous state from a JSON file or creates a new state if none exists
+	 */
+	async loadPreviousState(): Promise<void> {
+		if (!this.options.stateFilePath) {
+			return;
+		}
+
+		try {
+			const stateData = await fs.readFile(this.options.stateFilePath, "utf-8");
+			const parsedState = JSON.parse(stateData);
+
+			// Convert the array back to a Map
+			this.previousState = new Map(
+				Object.entries(parsedState).map(([key, value]) => {
+					const metadata = value as ObjectMetadata;
+					// Convert ISO string back to Date object
+					if (
+						metadata.lastModified &&
+						typeof metadata.lastModified === "string"
+					) {
+						metadata.lastModified = new Date(metadata.lastModified);
+					}
+					return [key, metadata];
+				}),
+			);
+		} catch (error) {
+			// If file doesn't exist or is invalid, start with an empty state
+			this.previousState = new Map();
+		}
+	}
+
+	/**
+	 * Saves the current state to a JSON file
+	 */
+	async saveCurrentState(): Promise<void> {
+		if (!this.options.stateFilePath) {
+			return;
+		}
+
+		// Convert Map to a plain object for serialization
+		const stateObject = Object.fromEntries(this.currentState);
+		const stateData = JSON.stringify(stateObject, null, 2);
+
+		// Ensure directory exists
+		const dir = path.dirname(this.options.stateFilePath);
+		await fs.mkdir(dir, { recursive: true });
+
+		// Write state file
+		await fs.writeFile(this.options.stateFilePath, stateData, "utf-8");
+	}
+
+	/**
+	 * Adds an object to the current state
+	 * @param object Object metadata to track
+	 */
+	addObject(object: ObjectMetadata): void {
+		this.currentState.set(object.key, object);
+	}
+
+	/**
+	 * Adds multiple objects to the current state
+	 * @param objects Array of object metadata
+	 */
+	addObjects(objects: ObjectMetadata[]): void {
+		for (const object of objects) {
+			this.addObject(object);
+		}
+	}
+
+	/**
+	 * Converts an S3 object to our metadata format
+	 * @param s3Object S3 object from AWS SDK
+	 * @returns Normalized object metadata
+	 */
+	static fromS3Object(s3Object: S3Object): ObjectMetadata {
+		return {
+			key: s3Object.key || "",
+			size: s3Object.size || 0,
+			etag: (s3Object.etag || "").replace(/"/g, ""), // Remove quotes from ETag
+			lastModified: s3Object.lastModified || new Date(),
+		};
+	}
+
+	/**
+	 * Determines if an object has changed between states
+	 * @param current Current object metadata
+	 * @param previous Previous object metadata
+	 * @returns True if the object has changed
+	 */
+	private hasObjectChanged(
+		current: ObjectMetadata,
+		previous: ObjectMetadata,
+	): boolean {
+		if (this.options.compareMode === "quick") {
+			// Quick comparison - only check size and last modified date
+			return (
+				current.size !== previous.size ||
+				current.lastModified.getTime() !== previous.lastModified.getTime()
+			);
+		}
+
+		// Full comparison - check ETag (hash) as well
+		// If ignoreEtagOnSize is true, skip ETag check when sizes match
+		if (this.options.ignoreEtagOnSize && current.size === previous.size) {
+			return current.lastModified.getTime() !== previous.lastModified.getTime();
+		}
+
+		return (
+			current.size !== previous.size ||
+			current.etag !== previous.etag ||
+			current.lastModified.getTime() !== previous.lastModified.getTime()
+		);
+	}
+
+	/**
+	 * Compares current state with previous state to detect changes
+	 * @returns Array of change results
+	 */
+	detectChanges(): ChangeResult[] {
+		const changes: ChangeResult[] = [];
+
+		// Check for new and modified objects
+		this.currentState.forEach((currentObject, key) => {
+			const previousObject = this.previousState.get(key);
+
+			if (!previousObject) {
+				// New object
+				changes.push({
+					changeType: ChangeType.Added,
+					object: currentObject,
+				});
+			} else if (this.hasObjectChanged(currentObject, previousObject)) {
+				// Modified object
+				changes.push({
+					changeType: ChangeType.Modified,
+					object: currentObject,
+					previousVersion: previousObject,
+				});
+			} else {
+				// Unchanged object
+				changes.push({
+					changeType: ChangeType.Unchanged,
+					object: currentObject,
+					previousVersion: previousObject,
+				});
+			}
+		});
+
+		// Check for deleted objects if enabled
+		if (this.options.trackDeleted) {
+			this.previousState.forEach((previousObject, key) => {
+				if (!this.currentState.has(key)) {
+					changes.push({
+						changeType: ChangeType.Deleted,
+						object: previousObject,
+					});
+				}
+			});
+		}
+
+		return changes;
+	}
+
+	/**
+	 * Filter changes by type
+	 * @param changes Array of change results
+	 * @param types Types of changes to include
+	 * @returns Filtered array of change results
+	 */
+	static filterChangesByType(
+		changes: ChangeResult[],
+		types: ChangeType[],
+	): ChangeResult[] {
+		return changes.filter((change) => types.includes(change.changeType));
+	}
+
+	/**
+	 * Creates a new state from the current state
+	 */
+	commitChanges(): void {
+		this.previousState = new Map(this.currentState);
+	}
+
+	/**
+	 * Clears the current state
+	 */
+	resetCurrentState(): void {
+		this.currentState = new Map();
+	}
+
+	/**
+	 * Clears all state (previous and current)
+	 */
+	resetAllState(): void {
+		this.previousState = new Map();
+		this.currentState = new Map();
+	}
+}
+
+/**
  * A utility class for efficient path lookups using micromatch
  */
 export class PathMatcher {
@@ -147,7 +418,33 @@ export class PathMatcher {
 		path: string,
 		options?: micromatch.Options,
 	): string[] | null {
-		return micromatch.capture(pattern, path, { ...this.options, ...options });
+		// Implementation that mimics micromatch.capture
+		// Parse the pattern and extract capture groups from the path
+		const placeholderRegex = /:[^\/\.]+/g;
+		const placeholders = pattern.match(placeholderRegex) || [];
+
+		// Replace placeholders with capture groups
+		let regexPattern = pattern.replace(/\//g, "\\/");
+		regexPattern = regexPattern.replace(/\./g, "\\.");
+
+		for (const placeholder of placeholders) {
+			// Replace :name with capturing group
+			regexPattern = regexPattern.replace(placeholder, "([^/\\.]+)");
+		}
+
+		// Replace asterisks with capturing groups for filenames
+		regexPattern = regexPattern.replace(/\*/g, "([^/]+)");
+
+		// Create a regex with the pattern
+		const regex = new RegExp(`^${regexPattern}$`, options?.nocase ? "i" : "");
+		const match = path.match(regex);
+
+		if (!match) {
+			return null;
+		}
+
+		// Return the captured values (skip the first element which is the full match)
+		return match.slice(1);
 	}
 }
 
@@ -180,11 +477,19 @@ export class S3PathMatcher extends PathMatcher {
 	 */
 	constructor(
 		options: micromatch.Options = {},
-		s3Options: { region?: string } = {},
+		s3Options: {
+			region?: string;
+			endpoint?: string;
+			credentials?: { accessKeyId: string; secretAccessKey: string };
+			forcePathStyle?: boolean;
+		} = {},
 	) {
 		super(options);
 		this.s3Client = new S3Client({
 			region: s3Options.region,
+			endpoint: s3Options.endpoint,
+			credentials: s3Options.credentials,
+			forcePathStyle: s3Options.forcePathStyle,
 			requestHandler: {
 				httpOptions: {
 					connectTimeout: 5000, // 5 seconds connect timeout
@@ -215,6 +520,11 @@ export class S3PathMatcher extends PathMatcher {
 			maxKeysPerRequest = 1000,
 			abortSignal,
 		} = options;
+
+		// Check upfront if operation is already aborted
+		if (abortSignal?.aborted) {
+			throw new Error("Operation aborted");
+		}
 
 		// Create a limiter for concurrent requests
 		const limiter = pLimit(maxConcurrentRequests);
@@ -262,7 +572,12 @@ export class S3PathMatcher extends PathMatcher {
 		let currentTokens: (string | undefined)[] = [undefined];
 
 		// Continue processing until no more tokens
-		while (currentTokens.length > 0 && !abortSignal?.aborted) {
+		while (currentTokens.length > 0) {
+			// Check if operation has been aborted before starting a new batch
+			if (abortSignal?.aborted) {
+				throw new Error("Operation aborted");
+			}
+
 			const processPromises = currentTokens.map((token) => {
 				const tokenParams = { ...params };
 				if (token) {
@@ -290,9 +605,11 @@ export class S3PathMatcher extends PathMatcher {
 					}
 				}
 			} catch (error) {
-				if (abortSignal?.aborted) {
-					throw new Error("Operation aborted");
+				// Let abort errors propagate
+				if (error instanceof Error && error.message === "Operation aborted") {
+					throw error;
 				}
+				// Rethrow other errors
 				throw error;
 			}
 		}
@@ -433,7 +750,7 @@ export class S3PathMatcher extends PathMatcher {
 						return processingLimiter(async () => {
 							processed++;
 
-							if (!item.Key || !pathMatchesFn(item.Key)) {
+							if (!(item.Key && pathMatchesFn(item.Key))) {
 								return null; // Not matching pattern
 							}
 
@@ -590,7 +907,9 @@ export class S3PathMatcher extends PathMatcher {
 					for (const item of contents) {
 						totalProcessed++;
 
-						if (!item.Key) continue;
+						if (!item.Key) {
+							continue;
+						}
 
 						// Check if it matches the pattern
 						if (!pathMatches(item.Key)) {
@@ -832,7 +1151,140 @@ async function example() {
 				},
 			},
 		);
+
+		// Clear the timeout
+		clearTimeout(timeout);
 	} catch (error) {
 		console.error("Error:", error);
+	}
+}
+
+// Example of using the ChangeDetectionEngine
+async function changeDetectionExample() {
+	try {
+		// Create a change detection engine with custom options
+		const changeEngine = new ChangeDetectionEngine({
+			stateFilePath: "./state/s3-changes.json",
+			compareMode: "quick", // Use quick comparison (size and lastModified only)
+			trackDeleted: true,
+		});
+
+		// Load the previous state from disk (if it exists)
+		await changeEngine.loadPreviousState();
+
+		// Create an S3 path matcher
+		const matcher = new S3PathMatcher({ dot: true }, { region: "us-west-2" });
+
+		// List objects using the S3PathMatcher's listObjects method
+		const allPaths = await matcher.listObjects("my-bucket", "data/");
+
+		// Create a client to get full metadata
+		const s3Client = new S3Client({ region: "us-west-2" });
+
+		// Create a batch of objects for the change detection engine
+		const objects: ObjectMetadata[] = allPaths.map((path) => ({
+			key: path,
+			size: 0, // These would be populated with real metadata
+			etag: "",
+			lastModified: new Date(),
+		}));
+
+		// In a real implementation, you would fetch the actual size, etag, and lastModified
+		// Let's assume we have that information for this example
+
+		// Add all objects to the current state
+		changeEngine.addObjects(objects);
+
+		// Detect changes from the previous run
+		const changes = changeEngine.detectChanges();
+
+		// Filter for just the new and modified files
+		const newFiles = ChangeDetectionEngine.filterChangesByType(changes, [
+			ChangeType.Added,
+		]);
+
+		const modifiedFiles = ChangeDetectionEngine.filterChangesByType(changes, [
+			ChangeType.Modified,
+		]);
+
+		const deletedFiles = ChangeDetectionEngine.filterChangesByType(changes, [
+			ChangeType.Deleted,
+		]);
+
+		// Print change summary
+		console.log(`Found ${newFiles.length} new files`);
+		console.log(`Found ${modifiedFiles.length} modified files`);
+		console.log(`Found ${deletedFiles.length} deleted files`);
+
+		// Define a local directory for downloading files
+		const downloadDir = "./downloads";
+		await fs.mkdir(downloadDir, { recursive: true });
+
+		// Process only new and modified files
+		const filesToProcess = [...newFiles, ...modifiedFiles];
+
+		// Limit concurrent processing
+		const processLimiter = pLimit(5);
+
+		// Process files concurrently
+		await Promise.all(
+			filesToProcess.map((changeResult) =>
+				processLimiter(async () => {
+					const { key } = changeResult.object;
+					console.log(`Processing ${key} (${changeResult.changeType})`);
+
+					// Example: Define local path for this file
+					const localPath = path.join(downloadDir, path.basename(key));
+
+					try {
+						// Download the file (simulated with a write operation)
+						// In a real scenario, you would use getObject from S3Client
+						await fs.writeFile(
+							localPath,
+							`Content for ${key} would be here`,
+							"utf-8",
+						);
+
+						// Example: Process the file based on its extension
+						const extension = path.extname(key).toLowerCase();
+
+						if (extension === ".json") {
+							console.log(`Parsing JSON file: ${key}`);
+							// JSON processing would go here
+						} else if (extension === ".csv") {
+							console.log(`Parsing CSV file: ${key}`);
+							// CSV processing would go here
+						} else {
+							console.log(`Skipping unknown file type: ${key}`);
+						}
+
+						console.log(`Successfully processed ${key}`);
+					} catch (err) {
+						console.error(`Error processing ${key}:`, err);
+					}
+				}),
+			),
+		);
+
+		// Handle deleted files if needed
+		for (const deletedFile of deletedFiles) {
+			const { key } = deletedFile.object;
+			console.log(`Handling deleted file: ${key}`);
+
+			// Example: Remove local copy if it exists
+			const localPath = path.join(downloadDir, path.basename(key));
+			try {
+				await fs.unlink(localPath);
+				console.log(`Removed local copy of deleted file: ${key}`);
+			} catch (err) {
+				// File might not exist locally, that's fine
+			}
+		}
+
+		// Save the current state for future comparison
+		await changeEngine.saveCurrentState();
+		console.log("Change detection workflow completed successfully");
+	} catch (error) {
+		console.error("Error in change detection:", error);
 	}
 }
