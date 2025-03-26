@@ -1,0 +1,175 @@
+{
+	"name": "rehiver",
+	"description": "Super-charge your S3 hive partitioned based file operations with intelligent pattern matching, change detection, optimized data-fetching, and out-of-the-box time series support.",
+	"version": "0.0.0",
+	"author": "Tim Mikeladze <tim.mikeladze@gmail.com>",
+	"license": "MIT",
+	"keywords": [
+		"s3",
+		"aws",
+		"hive",
+		"partitioning",
+		"timeseries",
+		"data-lake",
+		"etl",
+		"pattern-matching",
+		"glob",
+		"caching",
+		"change-detection",
+		"typescript",
+		"cloud-storage",
+		"data-processing",
+		"file-operations",
+		"aws-s3",
+		"s3-client",
+		"hive-partitioning",
+		"time-series",
+		"time-series-data",
+		"data-lake-tools",
+		"etl-tools",
+		"pattern-matching",
+		"glob-patterns",
+		"file-caching",
+		"change-tracking",
+		"typescript-library",
+		"cloud-storage-tools",
+		"data-processing-tools",
+		"file-operations-tools",
+		"aws-tools",
+		"s3-tools",
+		"hive-tools",
+		"partition-tools",
+		"timeseries-tools",
+		"data-lake-management",
+		"etl-pipeline",
+		"pattern-matching-tools",
+		"glob-matching",
+		"cache-management",
+		"change-detection-tools",
+		"typescript-aws",
+		"cloud-storage-management",
+		"data-processing-library",
+		"file-operations-library",
+		"aws-sdk",
+		"s3-operations",
+		"hive-parser",
+		"partition-parser",
+		"timeseries-parser",
+		"data-lake-parser",
+		"etl-parser",
+		"pattern-parser",
+		"glob-parser",
+		"cache-parser",
+		"change-parser",
+		"typescript-parser",
+		"cloud-parser",
+		"data-parser",
+		"file-parser"
+	],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/TimMikeladze/rehiver"
+	},
+	"scripts": {
+		"dev": "concurrently \"pnpm build --watch\" \"pnpm test\" ",
+		"build": "tsup",
+		"lint": "biome check --write --unsafe .",
+		"lint:ci": "biome check --unsafe .",
+		"test": "vitest",
+		"test:ci": "vitest run --coverage",
+		"commit": "cz",
+		"storybook": "storybook dev -p 6006",
+		"storybook:build": "storybook build",
+		"release": "pnpm build && pnpm release-it",
+		"link:self": "pnpm link --global",
+		"prepare": "lefthook install"
+	},
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"require": "./dist/index.js",
+			"import": "./dist/index.mjs"
+		}
+	},
+	"files": ["dist"],
+	"config": {
+		"commitizen": {
+			"path": "./node_modules/@ryansonshine/cz-conventional-changelog"
+		}
+	},
+	"release-it": {
+		"git": {
+			"commitMessage": "chore(release): v${version}"
+		},
+		"github": {
+			"release": true
+		},
+		"npm": {
+			"publish": false
+		}
+	},
+	"engines": {
+		"node": ">=18.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "1.9.4",
+		"@ryansonshine/commitizen": "4.2.8",
+		"@ryansonshine/cz-conventional-changelog": "3.3.4",
+		"@storybook/addon-essentials": "8.6.8",
+		"@storybook/addon-interactions": "8.6.8",
+		"@storybook/addon-links": "8.6.8",
+		"@storybook/addon-webpack5-compiler-swc": "3.0.0",
+		"@storybook/blocks": "8.6.8",
+		"@storybook/react": "8.6.8",
+		"@storybook/react-webpack5": "8.6.8",
+		"@storybook/test": "8.6.8",
+		"@testing-library/jest-dom": "6.6.3",
+		"@testing-library/react": "16.2.0",
+		"@types/micromatch": "^4.0.9",
+		"@types/mime-types": "^2.1.4",
+		"@types/node": "22.13.11",
+		"@types/react": "19.0.12",
+		"@types/react-dom": "19.0.4",
+		"@types/react-test-renderer": "19.0.0",
+		"@vitest/coverage-v8": "3.0.9",
+		"concurrently": "9.1.2",
+		"dotenv": "^16.4.7",
+		"jsdom": "26.0.0",
+		"lefthook": "1.11.3",
+		"prop-types": "15.8.1",
+		"react": "19.0.0",
+		"react-dom": "19.0.0",
+		"react-test-renderer": "19.0.0",
+		"release-it": "18.1.2",
+		"storybook": "8.6.8",
+		"ts-node": "10.9.2",
+		"tsconfig-paths": "4.2.0",
+		"tsup": "8.4.0",
+		"tsx": "4.19.3",
+		"typescript": "5.8.2",
+		"vitest": "3.0.9"
+	},
+	"peerDependencies": {
+		"react": ">=17",
+		"react-dom": ">=17"
+	},
+	"pnpm": {
+		"overrides": {
+			"micromatch@<4.0.8": ">=4.0.8"
+		},
+		"onlyBuiltDependencies": [
+			"@biomejs/biome",
+			"@swc/core",
+			"esbuild",
+			"lefthook"
+		]
+	},
+	"dependencies": {
+		"@aws-sdk/client-s3": "^3.772.0",
+		"lru-cache": "^11.0.2",
+		"micromatch": "^4.0.8",
+		"mime-types": "^2.1.35",
+		"p-limit": "^6.2.0",
+		"zod": "^3.24.2"
+	}
+}
