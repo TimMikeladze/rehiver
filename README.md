@@ -24,7 +24,7 @@ rehiver is your TypeScript powerhouse for S3 operations that makes working with 
 
 ## 🚀 Quick Start
 
-Here's a quick example demonstrating rehiver's core functionality for time series data operations:
+Here's a quick example demonstrating the core functionality of rehiver for a simple time series data pipeline:
 
 ```typescript
 import rehiver from 'rehiver';
