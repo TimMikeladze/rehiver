@@ -1,7 +1,7 @@
 {
 	"name": "rehiver",
 	"description": "Super-charge your S3 hive partitioned based file operations with intelligent pattern matching, change detection, optimized data-fetching, and out-of-the-box time series support.",
-	"version": "0.0.0",
+	"version": "1.0.0",
 	"author": "Tim Mikeladze <tim.mikeladze@gmail.com>",
 	"license": "MIT",
 	"keywords": [
