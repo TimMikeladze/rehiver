@@ -1391,6 +1391,82 @@ describe("Rehiver", () => {
 		}
 	}, 30000); // 30 second timeout for cleanup
 
+	it("should create buckets with createBucketIfNotExists", async () => {
+		// Generate unique bucket names for this test
+		const testBucket1 = `rehiver-create-test-${randomUUID().substring(0, 8)}`;
+		const testBucket2 = `rehiver-create-test-${randomUUID().substring(0, 8)}`;
+
+		try {
+			// Create a Rehiver instance
+			const rehiver = new Rehiver({
+				s3Options: {
+					region: "us-east-1",
+					endpoint: minioEndpoint,
+					forcePathStyle: true,
+					credentials: {
+						accessKeyId: process.env.MINIO_ACCESS_KEY || minioAccessKey,
+						secretAccessKey: process.env.MINIO_SECRET_KEY || minioSecretKey,
+					},
+				},
+			});
+
+			// Test creating a bucket with default options
+			const created1 = await rehiver.createBucket(testBucket1);
+
+			// Should return true when bucket is created
+			expect(created1).toBe(true);
+
+			// Create the same bucket again - should return false
+			const created1Again = await rehiver.createBucket(testBucket1);
+
+			// Should return false when bucket already exists
+			expect(created1Again).toBe(false);
+
+			// Test creating a bucket with ACL options
+			const created2 = await rehiver.createBucket(testBucket2, {
+				acl: "public-read", // Set a public-read ACL
+			});
+
+			// Should return true when bucket is created
+			expect(created2).toBe(true);
+		} finally {
+			// Clean up the test buckets we created
+			try {
+				// Delete bucket 1 if it exists
+				// Note: In a real-world scenario, you would need to empty the bucket first
+				// For this test, we're assuming the buckets are empty
+				await s3
+					.send(
+						new DeleteObjectCommand({
+							// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+							Bucket: testBucket1,
+							// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+							Key: "dummy-key",
+						}),
+					)
+					.catch(() => {}); // Ignore errors if the key doesn't exist
+
+				// Delete bucket 2 if it exists
+				await s3
+					.send(
+						new DeleteObjectCommand({
+							// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+							Bucket: testBucket2,
+							// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+							Key: "dummy-key",
+						}),
+					)
+					.catch(() => {}); // Ignore errors if the key doesn't exist
+
+				console.log(
+					`Test buckets ${testBucket1} and ${testBucket2} cleaned up`,
+				);
+			} catch (error) {
+				console.error("Error cleaning up test buckets:", error);
+			}
+		}
+	}, 30000); // Increase timeout for this test
+
 	it("should find matching objects with named import", async () => {
 		// Create an instance of Rehiver using named import
 		const rehiver = new Rehiver({

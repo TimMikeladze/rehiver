@@ -1,6 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+	type BucketLocationConstraint,
+	CreateBucketCommand,
+	type CreateBucketCommandInput,
+	HeadBucketCommand,
 	HeadObjectCommand,
 	ListObjectsV2Command,
 	type ListObjectsV2CommandInput,
@@ -775,6 +779,7 @@ export interface S3ClientConfig {
 	maxRetries?: number;
 	requestTimeout?: number;
 	connectTimeout?: number;
+	client?: S3Client;
 }
 
 /**
@@ -791,7 +796,7 @@ export interface MetadataCacheConfig {
  * A utility class for working with S3 paths and glob patterns
  */
 export class S3PathMatcher extends PathMatcher {
-	private readonly s3Client: S3Client;
+	protected s3Client: S3Client;
 	private readonly metadataCache: LRUCache<string, ObjectMetadata>;
 	private readonly cacheConfig: Required<MetadataCacheConfig>;
 	private readonly pendingRefreshes: Set<string> = new Set();
@@ -812,6 +817,7 @@ export class S3PathMatcher extends PathMatcher {
 			credentials?: { accessKeyId: string; secretAccessKey: string };
 			forcePathStyle?: boolean;
 			maxRetries?: number;
+			client?: S3Client;
 		} = {},
 		cacheOptions: MetadataCacheConfig = {},
 		logger: Logger = globalLogger,
@@ -820,14 +826,19 @@ export class S3PathMatcher extends PathMatcher {
 
 		this.logger = logger;
 
-		// Configure S3 client
-		this.s3Client = new S3Client({
-			region: s3Options.region || "us-east-1",
-			endpoint: s3Options.endpoint,
-			credentials: s3Options.credentials,
-			forcePathStyle: s3Options.forcePathStyle,
-			maxAttempts: s3Options.maxRetries || 3,
-		});
+		// Use provided S3 client or create a new one
+		if (s3Options.client) {
+			this.s3Client = s3Options.client;
+		} else {
+			// Configure S3 client
+			this.s3Client = new S3Client({
+				region: s3Options.region || "us-east-1",
+				endpoint: s3Options.endpoint,
+				credentials: s3Options.credentials,
+				forcePathStyle: s3Options.forcePathStyle,
+				maxAttempts: s3Options.maxRetries || 3,
+			});
+		}
 
 		// Configure metadata cache
 		this.cacheConfig = {
@@ -1531,6 +1542,14 @@ export class S3PathMatcher extends PathMatcher {
 
 		return stats;
 	}
+
+	/**
+	 * Get the S3 client instance
+	 * @returns The S3Client instance
+	 */
+	getS3Client(): S3Client {
+		return this.s3Client;
+	}
 }
 
 /**
@@ -2013,11 +2032,143 @@ export class Rehiver extends S3PathMatcher {
 		},
 	};
 
+	/**
+	 * Creates an S3 bucket if it doesn't already exist
+	 * @param bucketName Name of the bucket to create
+	 * @param options S3 client configuration and bucket creation options
+	 * @returns True if the bucket was created, false if it already existed
+	 * @throws If bucket name is invalid or creation fails for other reasons
+	 */
+	async createBucketIfNotExists(
+		bucketName: string,
+		options: {
+			region?: string;
+			endpoint?: string;
+			credentials?: {
+				accessKeyId: string;
+				secretAccessKey: string;
+				sessionToken?: string;
+			};
+			forcePathStyle?: boolean;
+			maxRetries?: number;
+			bucketOptions?: {
+				locationConstraint?: string;
+				acl?:
+					| "private"
+					| "public-read"
+					| "public-read-write"
+					| "authenticated-read";
+			};
+			logger?: Logger;
+			client?: S3Client;
+		} = {},
+	): Promise<boolean> {
+		// Validate bucket name
+		if (!isValidBucketName(bucketName)) {
+			throw new Error(
+				`Invalid bucket name: ${bucketName}. S3 bucket names must be 3-63 characters, contain only lowercase letters, numbers, periods, and hyphens, and cannot be formatted as an IP address.`,
+			);
+		}
+
+		const logger = options.logger || globalLogger;
+
+		// Use provided S3 client or create a new one
+		let s3Client: S3Client;
+		let shouldDestroyClient = false;
+
+		if (options.client) {
+			s3Client = options.client;
+		} else {
+			// Create S3 client
+			s3Client = new S3Client({
+				region: options.region || "us-east-1",
+				endpoint: options.endpoint,
+				credentials: options.credentials,
+				forcePathStyle: options.forcePathStyle,
+				maxAttempts: options.maxRetries || 3,
+			});
+			shouldDestroyClient = true;
+		}
+
+		try {
+			// Check if bucket exists
+			try {
+				// Try to head the bucket to check if it exists
+				// biome-ignore lint/style/useNamingConvention: <explanation>
+				await s3Client.send(new HeadBucketCommand({ Bucket: bucketName }));
+				logger.debug(`Bucket ${bucketName} already exists`);
+				return false; // Bucket already exists
+			} catch (error: unknown) {
+				// If the error is not a "bucket does not exist" error, rethrow it
+				const statusCode = (
+					error as { $metadata?: { httpStatusCode?: number } }
+				)?.$metadata?.httpStatusCode;
+				if (statusCode !== 404 && statusCode !== 403) {
+					throw error;
+				}
+
+				// Bucket doesn't exist, continue to creation
+				logger.info(`Bucket ${bucketName} does not exist, creating it`);
+			}
+
+			// Create bucket with options
+			const createBucketParams: CreateBucketCommandInput = {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+				Bucket: bucketName,
+			};
+
+			// Add location constraint if provided and not in us-east-1
+			// (us-east-1 is the default and should not be specified explicitly)
+			if (
+				options.bucketOptions?.locationConstraint &&
+				options.bucketOptions.locationConstraint !== "us-east-1"
+			) {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+				createBucketParams.CreateBucketConfiguration = {
+					// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+					LocationConstraint: options.bucketOptions
+						.locationConstraint as BucketLocationConstraint,
+				};
+			}
+
+			// Add ACL if provided
+			if (options.bucketOptions?.acl) {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase for API parameters
+				createBucketParams.ACL = options.bucketOptions.acl;
+			}
+
+			// Create the bucket with retries
+			await retryWithBackoff(
+				async () => s3Client.send(new CreateBucketCommand(createBucketParams)),
+				5,
+				100,
+				30000,
+				logger,
+			);
+
+			logger.info(`Successfully created bucket ${bucketName}`);
+			return true; // Bucket was created
+		} finally {
+			// Clean up the client only if we created it
+			if (shouldDestroyClient) {
+				s3Client.destroy();
+			}
+		}
+	}
+
 	partition = Rehiver.partition;
 	time = Rehiver.time;
 	changes = Rehiver.changes;
 
 	protected logger: Logger;
+	private s3ConfigOptions: {
+		region?: string;
+		endpoint?: string;
+		credentials?: { accessKeyId: string; secretAccessKey: string };
+		forcePathStyle?: boolean;
+		maxRetries?: number;
+		client?: S3Client;
+	};
 
 	constructor(
 		options: {
@@ -2028,6 +2179,7 @@ export class Rehiver extends S3PathMatcher {
 				credentials?: { accessKeyId: string; secretAccessKey: string };
 				forcePathStyle?: boolean;
 				maxRetries?: number;
+				client?: S3Client;
 			};
 			cacheOptions?: MetadataCacheConfig;
 			loggerOptions?: {
@@ -2050,10 +2202,24 @@ export class Rehiver extends S3PathMatcher {
 		// Store the logger reference
 		this.logger = logger;
 
+		// Store S3 options for later use
+		this.s3ConfigOptions = options.s3Options || {};
+
 		// Set logger level if specified
 		if (options.loggerOptions?.level !== undefined) {
 			this.logger.setLevel(options.loggerOptions.level);
 		}
+
+		// Store S3 client
+		this.s3Client =
+			options.s3Options?.client ||
+			new S3Client({
+				region: options.s3Options?.region || "us-east-1",
+				endpoint: options.s3Options?.endpoint,
+				credentials: options.s3Options?.credentials,
+				forcePathStyle: options.s3Options?.forcePathStyle,
+				maxAttempts: options.s3Options?.maxRetries || 3,
+			});
 	}
 
 	/**
@@ -2348,6 +2514,109 @@ export class Rehiver extends S3PathMatcher {
 			processor,
 			options || {},
 		);
+	}
+
+	/**
+	 * Creates an S3 bucket if it doesn't already exist
+	 * Simplified version that uses the instance's configuration
+	 * @param bucketName Name of the bucket to create
+	 * @param bucketOptions Bucket creation options
+	 * @returns True if the bucket was created, false if it already existed
+	 * @throws If bucket name is invalid or creation fails for other reasons
+	 */
+	async createBucket(
+		bucketName: string,
+		bucketOptions?: {
+			locationConstraint?: string;
+			acl?:
+				| "private"
+				| "public-read"
+				| "public-read-write"
+				| "authenticated-read";
+		},
+	): Promise<boolean> {
+		// Create options object for the full implementation
+		const options = {
+			region: this.s3ConfigOptions.region,
+			endpoint: this.s3ConfigOptions.endpoint,
+			credentials: this.s3ConfigOptions.credentials,
+			forcePathStyle: this.s3ConfigOptions.forcePathStyle,
+			maxRetries: this.s3ConfigOptions.maxRetries,
+			bucketOptions,
+			logger: this.logger,
+			client: this.getS3Client(),
+		};
+
+		// Validate bucket name
+		if (!isValidBucketName(bucketName)) {
+			throw new Error(
+				`Invalid bucket name: ${bucketName}. S3 bucket names must be 3-63 characters, contain only lowercase letters, numbers, periods, and hyphens, and cannot be formatted as an IP address.`,
+			);
+		}
+
+		const logger = options.logger || globalLogger;
+		const s3Client = options.client || this.getS3Client();
+
+		try {
+			// Check if bucket exists
+			try {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase
+				await s3Client.send(new HeadBucketCommand({ Bucket: bucketName }));
+				logger.debug(`Bucket ${bucketName} already exists`);
+				return false; // Bucket already exists
+			} catch (error: unknown) {
+				// If the error is not a "bucket does not exist" error, rethrow it
+				const statusCode = (
+					error as { $metadata?: { httpStatusCode?: number } }
+				)?.$metadata?.httpStatusCode;
+				if (statusCode !== 404 && statusCode !== 403) {
+					throw error;
+				}
+
+				// Bucket doesn't exist, continue to creation
+				logger.info(`Bucket ${bucketName} does not exist, creating it`);
+			}
+
+			// Create bucket with options
+			const createBucketParams: CreateBucketCommandInput = {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase
+				Bucket: bucketName,
+			};
+
+			// Add location constraint if provided and not in us-east-1
+			if (
+				bucketOptions?.locationConstraint &&
+				bucketOptions.locationConstraint !== "us-east-1"
+			) {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase
+				createBucketParams.CreateBucketConfiguration = {
+					// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase
+					LocationConstraint:
+						bucketOptions.locationConstraint as BucketLocationConstraint,
+				};
+			}
+
+			// Add ACL if provided
+			if (bucketOptions?.acl) {
+				// biome-ignore lint/style/useNamingConvention: AWS SDK uses PascalCase
+				createBucketParams.ACL = bucketOptions.acl;
+			}
+
+			// Create the bucket with retries
+			await retryWithBackoff(
+				async () => s3Client.send(new CreateBucketCommand(createBucketParams)),
+				5,
+				100,
+				30000,
+				logger,
+			);
+
+			logger.info(`Successfully created bucket ${bucketName}`);
+			return true; // Bucket was created
+		} catch (error) {
+			logger.error(`Failed to create bucket ${bucketName}: ${error}`);
+			throw error;
+		}
 	}
 }
 
